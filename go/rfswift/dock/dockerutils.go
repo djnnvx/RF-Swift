@@ -37,60 +37,32 @@ func DockerSetSeccomp(profile string) {
 	}
 }
 
-func DockerAddBinding(addbindings string) {
-	/* Add extra bindings to the Docker container
-	   in(1): string of bindings separated by commas
-	*/
-	if addbindings != "" {
-		// Check if extrabinding already has content, and append with a comma if it does
-		if dockerObj.extrabinding != "" {
-			dockerObj.extrabinding += "," + addbindings
-		} else {
-			dockerObj.extrabinding = addbindings
-		}
+// appendToField appends a value to a comma-separated field if not empty
+func appendToField(field *string, value string) {
+	if value == "" {
+		return
 	}
+	if *field != "" {
+		*field += "," + value
+	} else {
+		*field = value
+	}
+}
+
+func DockerAddBinding(addbindings string) {
+	appendToField(&dockerObj.extrabinding, addbindings)
 }
 
 func DockerAddCgroups(addcgroups string) {
-	/* Add extra cgroup rules to the Docker container
-	   in(1): string of cgroup rules separated by commas
-	*/
-	if addcgroups != "" {
-		// Check if cgroups already has content, and append with a comma if it does
-		if dockerObj.cgroups != "" {
-			dockerObj.cgroups += "," + addcgroups
-		} else {
-			dockerObj.cgroups = addcgroups
-		}
-	}
+	appendToField(&dockerObj.cgroups, addcgroups)
 }
 
 func DockerAddDevices(adddevices string) {
-	/* Add extra devices to the Docker container
-	   in(1): string of devices separated by commas
-	*/
-	if adddevices != "" {
-		// Check if extrabinding already has content, and append with a comma if it does
-		if dockerObj.devices != "" {
-			dockerObj.devices += "," + adddevices
-		} else {
-			dockerObj.devices = adddevices
-		}
-	}
+	appendToField(&dockerObj.devices, adddevices)
 }
 
 func DockerAddCaps(addcaps string) {
-	/* Add extra caps to the Docker container
-	   in(1): string of caps separated by commas
-	*/
-	if addcaps != "" {
-		// Check if extracap already has content, and append with a comma if it does
-		if dockerObj.caps != "" {
-			dockerObj.caps += "," + addcaps
-		} else {
-			dockerObj.caps = addcaps
-		}
-	}
+	appendToField(&dockerObj.caps, addcaps)
 }
 
 func DockerSetImage(imagename string) {
@@ -160,7 +132,7 @@ func DockerSetExposedPorts(exposedports string) {
 	}
 }
 
-func DockerSetBindexPorts(bindedports string) {
+func DockerSetBindedPorts(bindedports string) {
 	if bindedports != "" {
 		dockerObj.binded_ports = bindedports
 	}

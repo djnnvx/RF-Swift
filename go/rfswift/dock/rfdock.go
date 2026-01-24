@@ -3,6 +3,7 @@ package dock
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -19,7 +20,7 @@ import (
 	"context"
 	"gopkg.in/yaml.v3"
 	"compress/gzip"
-	
+
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
@@ -27,14 +28,26 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/jsonmessage"
-	
+
 	"github.com/docker/go-connections/nat"
 	"github.com/moby/term"
 	"golang.org/x/crypto/ssh/terminal"
-	
+
 	common "penthertz/rfswift/common"
 	rfutils "penthertz/rfswift/rfutils"
 )
+
+// Sentinel errors for consistent error handling
+var (
+	ErrTagNotFound       = errors.New("tag not found")
+	ErrContainerNotFound = errors.New("container not found")
+	ErrImageNotFound     = errors.New("image not found")
+)
+
+// formatImageRef formats a repository and tag into a full image reference
+func formatImageRef(repo, tag string) string {
+	return fmt.Sprintf("%s:%s", repo, tag)
+}
 
 type HostConfigFull struct {
 	Binds                []string                 `json:"Binds"`
@@ -345,7 +358,7 @@ func checkImageStatus(ctx context.Context, cli *client.Client, repo, tag string)
 	architecture := getArchitecture()
 
 	// Get the local image creation date
-	localImageTime, err := getLocalImageCreationDate(ctx, cli, fmt.Sprintf("%s:%s", repo, tag))
+	localImageTime, err := getLocalImageCreationDate(ctx, cli, formatImageRef(repo, tag))
 	if err != nil {
 		return false, true, err
 	}
@@ -353,7 +366,7 @@ func checkImageStatus(ctx context.Context, cli *client.Client, repo, tag string)
 	// Get the remote image creation date
 	remoteImageTime, err := getRemoteImageCreationDate(repo, tag, architecture)
 	if err != nil {
-		if err.Error() == "tag not found" {
+		if errors.Is(err, ErrTagNotFound) {
 			return false, true, nil // Custom image if tag not found
 		}
 		return false, true, err
@@ -381,7 +394,7 @@ func printContainerProperties(ctx context.Context, cli *client.Client, container
 	repo, tag := parseImageName(props["ImageName"])
 	isUpToDate, isCustom, err := checkImageStatus(ctx, cli, repo, tag)
 	if err != nil {
-		if err.Error() != "tag not found" {
+		if !errors.Is(err, ErrTagNotFound) {
 			log.Printf("Error checking image status: %v", err)
 		}
 	}
@@ -525,7 +538,8 @@ func DockerLast(ifilter string, labelKey string, labelValue string) {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		panic(err)
+		common.PrintErrorMessage(err)
+		return
 	}
 	defer cli.Close()
 
@@ -543,7 +557,8 @@ func DockerLast(ifilter string, labelKey string, labelValue string) {
 		Filters: containerFilters,
 	})
 	if err != nil {
-		panic(err)
+		common.PrintErrorMessage(err)
+		return
 	}
 
 	// Create maps to store image mappings
@@ -553,7 +568,8 @@ func DockerLast(ifilter string, labelKey string, labelValue string) {
 	// Get all images to build a mapping of image IDs to all their tags
 	images, err := cli.ImageList(ctx, image.ListOptions{All: true})
 	if err != nil {
-		panic(err)
+		common.PrintErrorMessage(err)
+		return
 	}
 
 	// Build image ID to names mapping
@@ -803,7 +819,8 @@ func latestDockerID(labelKey string, labelValue string) string {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		panic(err)
+		common.PrintErrorMessage(err)
+		return ""
 	}
 	defer cli.Close()
 
@@ -816,7 +833,8 @@ func latestDockerID(labelKey string, labelValue string) string {
 		Filters: containerFilters,
 	})
 	if err != nil {
-		panic(err)
+		common.PrintErrorMessage(err)
+		return ""
 	}
 
 	var latestContainer types.Container
@@ -1205,7 +1223,7 @@ func DockerRun(containerName string) {
 
 	if !strings.Contains(dockerObj.imagename, ":") {
 		// Prepend Config.General.RepoTag if the format is missing
-		dockerObj.imagename = fmt.Sprintf("%s:%s", dockerObj.repotag, dockerObj.imagename)
+		dockerObj.imagename = formatImageRef(dockerObj.repotag, dockerObj.imagename)
 	}
 
 	bindings := combineBindings(dockerObj.x11forward, dockerObj.extrabinding)
@@ -1344,7 +1362,8 @@ func execCommandInContainer(ctx context.Context, cli *client.Client, contid, Wor
 
 	rst, err := cli.ContainerExecCreate(ctx, contid, optionsCreate)
 	if err != nil {
-		panic(err)
+		common.PrintErrorMessage(err)
+		return
 	}
 
 	optionsStartCheck := container.ExecStartOptions{
@@ -1354,7 +1373,8 @@ func execCommandInContainer(ctx context.Context, cli *client.Client, contid, Wor
 
 	response, err := cli.ContainerExecAttach(ctx, rst.ID, optionsStartCheck)
 	if err != nil {
-		panic(err)
+		common.PrintErrorMessage(err)
+		return
 	}
 	defer response.Close()
 
@@ -1370,7 +1390,8 @@ func attachAndInteract(ctx context.Context, cli *client.Client, contid string) {
 		Stream: true,
 	})
 	if err != nil {
-		panic(err)
+		common.PrintErrorMessage(err)
+		return
 	}
 	defer response.Close()
 
@@ -1380,7 +1401,8 @@ func attachAndInteract(ctx context.Context, cli *client.Client, contid string) {
 	if terminal.IsTerminal(fd) {
 		oldState, err := terminal.MakeRaw(fd)
 		if err != nil {
-			panic(err)
+			common.PrintErrorMessage(err)
+			return
 		}
 		defer terminal.Restore(fd, oldState)
 
@@ -1413,7 +1435,7 @@ func waitForContainer(ctx context.Context, cli *client.Client, contid string) {
 	select {
 	case err := <-errCh:
 		if err != nil {
-			panic(err)
+			common.PrintErrorMessage(err)
 		}
 	case <-statusCh:
 	}
@@ -1450,17 +1472,20 @@ func DockerCommit(contid string) {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		panic(err)
+		common.PrintErrorMessage(err)
+		return
 	}
 	defer cli.Close()
 
 	if err := cli.ContainerStart(ctx, contid, container.StartOptions{}); err != nil {
-		panic(err)
+		common.PrintErrorMessage(err)
+		return
 	}
 
 	commitResp, err := cli.ContainerCommit(ctx, contid, container.CommitOptions{Reference: dockerObj.imagename})
 	if err != nil {
-		panic(err)
+		common.PrintErrorMessage(err)
+		return
 	}
 	fmt.Println(commitResp.ID)
 }
@@ -1479,7 +1504,7 @@ func DockerPull(imageref string, imagetag string) {
 
 	// If imageref doesn't contain ":", prepend the repo tag
 	if !strings.Contains(imageref, ":") {
-		imageref = fmt.Sprintf("%s:%s", dockerObj.repotag, imageref)
+		imageref = formatImageRef(dockerObj.repotag, imageref)
 	}
 
 	// Parse the image reference to get repo and tag
@@ -1517,7 +1542,7 @@ func DockerPull(imageref string, imagetag string) {
 	// Set the display tag (without architecture suffix for cleaner naming)
 	if imagetag == "" {
 		// Use clean tag name without architecture suffix
-		imagetag = fmt.Sprintf("%s:%s", repo, tag)
+		imagetag = formatImageRef(repo, tag)
 	}
 
 	// Check if the image exists locally
@@ -1616,16 +1641,17 @@ func DockerTag(imageref string, imagetag string) {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		panic(err)
+		common.PrintErrorMessage(err)
+		return
 	}
 	defer cli.Close()
 
 	err = cli.ImageTag(ctx, imageref, imagetag)
 	if err != nil {
-		panic(err)
-	} else {
-		fmt.Println("[+] Image renamed!")
+		common.PrintErrorMessage(err)
+		return
 	}
+	fmt.Println("[+] Image renamed!")
 }
 
 func DockerRename(currentIdentifier string, newName string) {
@@ -1636,14 +1662,16 @@ func DockerRename(currentIdentifier string, newName string) {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		panic(err)
+		common.PrintErrorMessage(err)
+		return
 	}
 	defer cli.Close()
 
 	// Attempt to find the container by the identifier (name or ID)
 	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
-		panic(err)
+		common.PrintErrorMessage(err)
+		return
 	}
 
 	var containerID string
@@ -1655,16 +1683,17 @@ func DockerRename(currentIdentifier string, newName string) {
 	}
 
 	if containerID == "" {
-		log.Fatalf("Container with ID or name '%s' not found.", currentIdentifier)
+		common.PrintErrorMessage(fmt.Errorf("container with ID or name '%s' not found", currentIdentifier))
+		return
 	}
 
 	// Rename the container
 	err = cli.ContainerRename(ctx, containerID, newName)
 	if err != nil {
-		panic(err)
-	} else {
-		fmt.Printf("[+] Container '%s' renamed to '%s'!\n", currentIdentifier, newName)
+		common.PrintErrorMessage(err)
+		return
 	}
+	fmt.Printf("[+] Container '%s' renamed to '%s'!\n", currentIdentifier, newName)
 }
 
 func DockerRemove(containerIdentifier string) {
@@ -1765,6 +1794,9 @@ func PrintImagesTable(labelKey string, labelValue string) {
 	for _, image := range images {
 		for _, repoTag := range image.RepoTags {
 			repoTagParts := strings.Split(repoTag, ":")
+			if len(repoTagParts) < 2 {
+				continue // Skip malformed repo:tag entries
+			}
 			repository := repoTagParts[0]
 			tag := repoTagParts[1]
 

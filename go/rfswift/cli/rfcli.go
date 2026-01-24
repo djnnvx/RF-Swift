@@ -85,7 +85,7 @@ var runCmd = &cobra.Command{
 		rfdock.DockerSetPulse(PulseServer)
 		rfdock.DockerSetNetworkMode(NetMode)
 		rfdock.DockerSetExposedPorts(NetExporsedPorts)
-		rfdock.DockerSetBindexPorts(NetBindedPorts)
+		rfdock.DockerSetBindedPorts(NetBindedPorts)
 		rfdock.DockerAddDevices(Devices)
 		rfdock.DockerAddCaps(Caps)
 		rfdock.DockerAddCgroups(Cgroups)

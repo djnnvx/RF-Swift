@@ -187,7 +187,7 @@ func getRemoteImageCreationDateFallback(body []byte, tag, architecture string) (
 		}
 	}
 
-	return time.Time{}, fmt.Errorf("tag not found")
+	return time.Time{}, ErrTagNotFound
 }
 
 func getLatestDockerHubTags(repo string, architecture string) ([]Tag, error) {
