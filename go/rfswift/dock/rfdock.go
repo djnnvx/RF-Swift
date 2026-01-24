@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/signal"
@@ -20,6 +19,7 @@ import (
 	"context"
 	"gopkg.in/yaml.v3"
 	"compress/gzip"
+	"net/http"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -243,6 +243,233 @@ func init() {
 	updateDockerObjFromConfig()
 }
 
+// formatVersionsMultiLine formats versions into multiple lines with a max per line
+func formatVersionsMultiLine(versions []string, maxPerLine int, maxWidth int) []string {
+	if len(versions) == 0 {
+		return []string{"-"}
+	}
+
+	var lines []string
+	var currentLine strings.Builder
+	countOnLine := 0
+
+	for i, v := range versions {
+		// Check if adding this version would exceed width or count
+		separator := ""
+		if countOnLine > 0 {
+			separator = ", "
+		}
+		
+		testLen := currentLine.Len() + len(separator) + len(v)
+		
+		if countOnLine >= maxPerLine || (maxWidth > 0 && testLen > maxWidth) {
+			// Start new line
+			if currentLine.Len() > 0 {
+				lines = append(lines, currentLine.String())
+			}
+			currentLine.Reset()
+			countOnLine = 0
+			separator = ""
+		}
+
+		if countOnLine > 0 {
+			currentLine.WriteString(", ")
+		}
+		currentLine.WriteString(v)
+		countOnLine++
+
+		// Last item
+		if i == len(versions)-1 && currentLine.Len() > 0 {
+			lines = append(lines, currentLine.String())
+		}
+	}
+
+	if len(lines) == 0 {
+		return []string{"-"}
+	}
+
+	return lines
+}
+
+// printTableWithMultiLineSupport prints a table where cells can have multiple lines
+func printTableWithMultiLineSupport(headers []string, rows [][]interface{}, columnWidths []int, title string, titleColor string) {
+	white := "\033[37m"
+	reset := "\033[0m"
+
+	// Calculate total width
+	totalWidth := 1
+	for _, w := range columnWidths {
+		totalWidth += w + 3
+	}
+
+	// Print title
+	fmt.Printf("%s%s%s%s%s\n", titleColor, strings.Repeat(" ", 2), title, strings.Repeat(" ", totalWidth-2-len(title)), reset)
+	fmt.Print(white)
+
+	// Print top border
+	printHorizontalBorder(columnWidths, "┌", "┬", "┐")
+
+	// Print headers
+	headerStrings := make([]string, len(headers))
+	for i, h := range headers {
+		headerStrings[i] = h
+	}
+	printRow(headerStrings, columnWidths, "│")
+	printHorizontalBorder(columnWidths, "├", "┼", "┤")
+
+	// Print rows with multi-line support
+	for rowIdx, row := range rows {
+		// Convert row to string slices (each cell can be []string for multi-line)
+		cellLines := make([][]string, len(row))
+		maxLines := 1
+
+		for colIdx, cell := range row {
+			switch v := cell.(type) {
+			case string:
+				cellLines[colIdx] = []string{v}
+			case []string:
+				if len(v) == 0 {
+					cellLines[colIdx] = []string{""}
+				} else {
+					cellLines[colIdx] = v
+				}
+			default:
+				cellLines[colIdx] = []string{fmt.Sprintf("%v", v)}
+			}
+			if len(cellLines[colIdx]) > maxLines {
+				maxLines = len(cellLines[colIdx])
+			}
+		}
+
+		// Print each line of this row
+		for lineIdx := 0; lineIdx < maxLines; lineIdx++ {
+			fmt.Print("│")
+			for colIdx, lines := range cellLines {
+				content := ""
+				if lineIdx < len(lines) {
+					content = lines[lineIdx]
+				}
+				
+				// Apply color for specific columns (status, version)
+				color := getColumnColor(colIdx, content, len(row))
+				
+				if color != "" {
+					fmt.Printf(" %s%-*s%s ", color, columnWidths[colIdx], truncateString(content, columnWidths[colIdx]), reset)
+				} else {
+					fmt.Printf(" %-*s ", columnWidths[colIdx], truncateString(content, columnWidths[colIdx]))
+				}
+				fmt.Print("│")
+			}
+			fmt.Println()
+		}
+
+		// Print row separator (except for last row)
+		if rowIdx < len(rows)-1 {
+			printHorizontalBorder(columnWidths, "├", "┼", "┤")
+		}
+	}
+
+	// Print bottom border
+	printHorizontalBorder(columnWidths, "└", "┴", "┘")
+	fmt.Print(reset)
+	fmt.Println()
+}
+
+// getColumnColor returns the color for a specific column value
+func getColumnColor(colIdx int, content string, totalCols int) string {
+	green := "\033[32m"
+	red := "\033[31m"
+	yellow := "\033[33m"
+	cyan := "\033[36m"
+
+	// Status column (usually second to last or specific index)
+	statusKeywords := map[string]string{
+		"Up to date": green,
+		"Obsolete":   red,
+		"Custom":     yellow,
+		"No network": yellow,
+		"Error":      red,
+	}
+
+	if color, ok := statusKeywords[content]; ok {
+		return color
+	}
+
+	// Version column - if it starts with "v" or contains version-like pattern
+	if strings.HasPrefix(content, "v") || strings.Contains(content, ".") {
+		// Check if it looks like a version
+		if len(content) > 0 && content != "-" {
+			return cyan
+		}
+	}
+
+	return ""
+}
+
+func normalizeImageName(imageName string) string {
+	if imageName == "" || strings.Contains(imageName, ":") {
+		return imageName
+	}
+	return formatImageRef(dockerObj.repotag, imageName)
+}
+
+func newDockerClient() (*client.Client, error) {
+	return client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+}
+
+
+// getRemoteImageDigest fetches the digest for a specific tag from Docker Hub
+func getRemoteImageDigest(repo, tag, architecture string) (string, error) {
+    var digest string
+    
+    // Normalize tag to include architecture suffix
+    normalizedTag := normalizeTagForRemote(tag, architecture)
+    
+    err := showLoadingIndicatorWithReturn(func() error {
+        url := fmt.Sprintf("https://hub.docker.com/v2/repositories/%s/tags/?page_size=100", repo)
+        client := &http.Client{Timeout: 10 * time.Second}
+        resp, err := client.Get(url)
+        if err != nil {
+            return err
+        }
+        defer resp.Body.Close()
+
+        if resp.StatusCode == http.StatusNotFound {
+            return fmt.Errorf("tag not found")
+        } else if resp.StatusCode != http.StatusOK {
+            return fmt.Errorf("failed to get tags: %s", resp.Status)
+        }
+
+        body, err := io.ReadAll(resp.Body)
+        if err != nil {
+            return err
+        }
+
+        var response DockerHubResponse
+        if err := json.Unmarshal(body, &response); err != nil {
+            return err
+        }
+
+        for _, hubTag := range response.Results {
+            if hubTag.Name == normalizedTag {
+                if strings.HasPrefix(hubTag.Name, "cache_") {
+                    continue
+                }
+                if hubTag.MediaType != "application/vnd.oci.image.index.v1+json" {
+                    continue
+                }
+                
+                digest = hubTag.Digest
+                return nil
+            }
+        }
+
+        return fmt.Errorf("tag not found")
+    }, fmt.Sprintf("Checking Docker Hub for '%s' (%s)", tag, architecture))
+
+    return digest, err
+}
+
 func updateDockerObjFromConfig() {
 	config, err := rfutils.ReadOrCreateConfig(common.ConfigFileByPlatform())
 	if err != nil {
@@ -350,36 +577,148 @@ func getLocalImageCreationDate(ctx context.Context, cli *client.Client, imageNam
 	return localImageTime, nil
 }
 
+func extractDigestFromImage(repoDigests []string) string {
+	for _, repoDigest := range repoDigests {
+		if idx := strings.Index(repoDigest, "@"); idx != -1 {
+			return repoDigest[idx+1:]
+		}
+	}
+	return ""
+}
+
+func findLatestVersion(versions []VersionInfo) (string, string) {
+	for _, v := range versions {
+		if v.Version != "latest" {
+			return v.Version, v.Digest
+		}
+	}
+	return "", ""
+}
+
+func findVersionByDigest(versions []VersionInfo, digest string) string {
+	for _, v := range versions {
+		if v.Digest == digest && v.Version != "latest" {
+			return v.Version
+		}
+	}
+	return ""
+}
+
+func findDigestForVersion(versions []VersionInfo, version string) string {
+	for _, v := range versions {
+		if v.Version == version {
+			return v.Digest
+		}
+	}
+	return ""
+}
+
+func checkImageStatusWithCache(ctx context.Context, cli *client.Client, repo, tag string, architecture string, cachedVersionsByRepo RepoVersionMap) (bool, bool, error) {
+	if common.Disconnected {
+		return false, true, nil
+	}
+
+	fullImageName := formatImageRef(repo, tag)
+	if !IsOfficialImage(fullImageName) {
+		return false, true, nil
+	}
+
+	localImage, _, err := cli.ImageInspectWithRaw(ctx, fullImageName)
+	if err != nil {
+		return false, true, err
+	}
+
+	localDigest := extractDigestFromImage(localImage.RepoDigests)
+	baseName, version := parseTagVersion(tag)
+
+	repoVersions, ok := cachedVersionsByRepo[repo]
+	if !ok || len(repoVersions) == 0 {
+		return false, true, nil
+	}
+
+	versions, ok := repoVersions[baseName]
+	if !ok || len(versions) == 0 {
+		return false, true, nil
+	}
+
+	latestVersion, latestDigest := findLatestVersion(versions)
+
+	if version != "" {
+		return checkVersionedTagStatus(versions, version, latestVersion, localDigest)
+	}
+	return checkUnversionedTagStatus(versions, localDigest, latestVersion, latestDigest)
+}
+
+func checkVersionedTagStatus(versions []VersionInfo, version, latestVersion, localDigest string) (bool, bool, error) {
+	if latestVersion != "" && compareVersions(version, latestVersion) < 0 {
+		return false, false, nil
+	}
+
+	remoteDigest := findDigestForVersion(versions, version)
+	if remoteDigest == "" {
+		return false, true, nil
+	}
+	if localDigest != "" && remoteDigest == localDigest {
+		return true, false, nil
+	}
+	return false, false, nil
+}
+
+func checkUnversionedTagStatus(versions []VersionInfo, localDigest, latestVersion, latestDigest string) (bool, bool, error) {
+	matchedVersion := findVersionByDigest(versions, localDigest)
+
+	if matchedVersion != "" {
+		if latestVersion != "" && compareVersions(matchedVersion, latestVersion) < 0 {
+			return false, false, nil
+		}
+		return true, false, nil
+	}
+
+	if latestDigest != "" && localDigest != "" {
+		return localDigest == latestDigest, false, nil
+	}
+
+	for _, v := range versions {
+		if v.Version == "latest" {
+			return localDigest != "" && v.Digest == localDigest, false, nil
+		}
+	}
+
+	return false, true, nil
+}
+
 func checkImageStatus(ctx context.Context, cli *client.Client, repo, tag string) (bool, bool, error) {
-	const DefaultMessage = "test"
 	if common.Disconnected {
 		return false, true, nil
 	}
 	architecture := getArchitecture()
 
-	// Get the local image creation date
-	localImageTime, err := getLocalImageCreationDate(ctx, cli, formatImageRef(repo, tag))
-	if err != nil {
-		return false, true, err
+	// Check if this is an official image
+	fullImageName := formatImageRef(repo, tag)
+	if !IsOfficialImage(fullImageName) {
+		return false, true, nil // Custom image
 	}
 
-	// Get the remote image creation date
-	remoteImageTime, err := getRemoteImageCreationDate(repo, tag, architecture)
+	// Fetch versions by repo
+	cachedVersionsByRepo := GetAllRemoteVersionsByRepo(architecture)
+
+	return checkImageStatusWithCache(ctx, cli, repo, tag, architecture, cachedVersionsByRepo)
+}
+
+// getLocalImageDigest gets the digest for a local image
+func getLocalImageDigest(ctx context.Context, cli *client.Client, imageName string) string {
+	imageInspect, _, err := cli.ImageInspectWithRaw(ctx, imageName)
 	if err != nil {
-		if errors.Is(err, ErrTagNotFound) {
-			return false, true, nil // Custom image if tag not found
+		return ""
+	}
+
+	for _, repoDigest := range imageInspect.RepoDigests {
+		if idx := strings.Index(repoDigest, "@"); idx != -1 {
+			return repoDigest[idx+1:]
 		}
-		return false, true, err
 	}
 
-	// Adjust the remote image creation time by an offset of 2 hours
-	remoteImageTimeAdjusted := remoteImageTime.Add(-2 * time.Hour)
-
-	// Compare local and adjusted remote image times
-	if localImageTime.Before(remoteImageTimeAdjusted) {
-		return false, false, nil // Obsolete
-	}
-	return true, false, nil // Up-to-date
+	return ""
 }
 
 func printContainerProperties(ctx context.Context, cli *client.Client, containerName string, props map[string]string, size string) {
@@ -759,26 +1098,6 @@ func DockerLast(ifilter string, labelKey string, labelValue string) {
 	fmt.Println()
 }
 
-func printHorizontalBorder(columnWidths []int, left, middle, right string) {
-	fmt.Print(left)
-	for i, width := range columnWidths {
-		fmt.Print(strings.Repeat("─", width+2))
-		if i < len(columnWidths)-1 {
-			fmt.Print(middle)
-		}
-	}
-	fmt.Println(right)
-}
-
-func printRow(row []string, columnWidths []int, separator string) {
-	fmt.Print(separator)
-	for i, col := range row {
-		fmt.Printf(" %-*s ", columnWidths[i], col)
-		fmt.Print(separator)
-	}
-	fmt.Println()
-}
-
 func distributeColumnWidths(availableWidth int, columnWidths []int) []int {
 	totalCurrentWidth := 0
 	for _, width := range columnWidths {
@@ -791,23 +1110,6 @@ func distributeColumnWidths(availableWidth int, columnWidths []int) []int {
 		}
 	}
 	return columnWidths
-}
-
-func truncateString(s string, maxLength int) string {
-	if maxLength < 0 {
-		return ""
-	}
-	if len(s) <= maxLength {
-		return s
-	}
-	if maxLength < 3 {
-		// If maxLength is too small for ellipsis, just truncate
-		if maxLength <= len(s) {
-			return s[:maxLength]
-		}
-		return s
-	}
-	return s[:maxLength-3] + "..."
 }
 
 func latestDockerID(labelKey string, labelValue string) string {
@@ -991,13 +1293,32 @@ func DockerExec(containerIdentifier string, WorkingDir string) {
 	size := props["Size"]
 	printContainerProperties(ctx, cli, containerName, props, size)
 
+	// Determine shell to use:
+	// Priority: 1) explicitly set via CLI (-e flag) if different from default
+	//           2) container's original shell (from containerJSON.Path)
+	//           3) fallback to /bin/bash
+	shellToUse := dockerObj.shell
+	
+	// If shell is empty or default, prefer container's configured shell
+	if shellToUse == "" || shellToUse == "/bin/bash" {
+		containerShell := containerJSON.Path
+		if containerShell != "" {
+			shellToUse = containerShell
+		}
+	}
+	
+	// Final fallback
+	if shellToUse == "" {
+		shellToUse = "/bin/bash"
+	}
+
 	// Create exec configuration
 	execConfig := container.ExecOptions{
 		AttachStdin:  true,
 		AttachStdout: true,
 		AttachStderr: true,
 		Tty:          true,
-		Cmd:          []string{dockerObj.shell},
+		Cmd:          []string{shellToUse},
 		WorkingDir:   WorkingDir,
 	}
 
@@ -1221,10 +1542,7 @@ func DockerRun(containerName string) {
 	}
 	defer cli.Close()
 
-	if !strings.Contains(dockerObj.imagename, ":") {
-		// Prepend Config.General.RepoTag if the format is missing
-		dockerObj.imagename = formatImageRef(dockerObj.repotag, dockerObj.imagename)
-	}
+	dockerObj.imagename = normalizeImageName(dockerObj.imagename)
 
 	bindings := combineBindings(dockerObj.x11forward, dockerObj.extrabinding)
 	extrahosts := splitAndCombine(dockerObj.extrahosts)
@@ -1502,10 +1820,7 @@ func DockerPull(imageref string, imagetag string) {
 	// Get current architecture
 	architecture := getArchitecture()
 
-	// If imageref doesn't contain ":", prepend the repo tag
-	if !strings.Contains(imageref, ":") {
-		imageref = formatImageRef(dockerObj.repotag, imageref)
-	}
+	imageref = normalizeImageName(imageref)
 
 	// Parse the image reference to get repo and tag
 	parts := strings.Split(imageref, ":")
@@ -1646,6 +1961,9 @@ func DockerTag(imageref string, imagetag string) {
 	}
 	defer cli.Close()
 
+	// Normalize source image reference
+	imageref = normalizeImageName(imageref)
+
 	err = cli.ImageTag(ctx, imageref, imagetag)
 	if err != nil {
 		common.PrintErrorMessage(err)
@@ -1773,35 +2091,53 @@ func ListImages(labelKey string, labelValue string) ([]image.Summary, error) {
 	return filteredImages, nil
 }
 
-func PrintImagesTable(labelKey string, labelValue string) {
+func PrintImagesTable(labelKey string, labelValue string, showVersions bool, filterImage string) {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		log.Fatalf("Error creating Docker client: %v", err)
+		common.PrintErrorMessage(err)
+		return
 	}
 	defer cli.Close()
 
 	images, err := ListImages(labelKey, labelValue)
 	if err != nil {
-		log.Fatalf("Error listing images: %v", err)
+		common.PrintErrorMessage(err)
+		return
 	}
 
 	rfutils.ClearScreen()
 
+	// Fetch remote versions ONCE for all checks - BY REPO
+	architecture := getArchitecture()
+	var remoteVersionsByRepo RepoVersionMap
+	if !common.Disconnected {
+		remoteVersionsByRepo = GetAllRemoteVersionsByRepo(architecture)
+	} else {
+		remoteVersionsByRepo = make(RepoVersionMap)
+	}
+
 	// Prepare table data
 	tableData := [][]string{}
 	maxStatusLength := 0
+	maxVersionLength := 0
+
 	for _, image := range images {
 		for _, repoTag := range image.RepoTags {
 			repoTagParts := strings.Split(repoTag, ":")
 			if len(repoTagParts) < 2 {
-				continue // Skip malformed repo:tag entries
+				continue
 			}
 			repository := repoTagParts[0]
 			tag := repoTagParts[1]
 
-			// Check image status
-			isUpToDate, isCustom, err := checkImageStatus(ctx, cli, repository, tag)
+			// Apply filter if specified
+			if filterImage != "" && !strings.Contains(strings.ToLower(tag), strings.ToLower(filterImage)) {
+				continue
+			}
+
+			// Check image status using cached versions BY REPO
+			isUpToDate, isCustom, err := checkImageStatusWithCache(ctx, cli, repository, tag, architecture, remoteVersionsByRepo)
 			var status string
 			if err != nil {
 				status = "Error"
@@ -1823,21 +2159,64 @@ func PrintImagesTable(labelKey string, labelValue string) {
 			created := time.Unix(image.Created, 0).Format(time.RFC3339)
 			size := fmt.Sprintf("%.2f MB", float64(image.Size)/1024/1024)
 
-			tableData = append(tableData, []string{
+			// Get version info from cached data FOR THIS REPO
+			versionDisplay := ""
+			if showVersions {
+				baseName, existingVersion := parseTagVersion(tag)
+
+				// If tag already has a version, display it
+				if existingVersion != "" {
+					versionDisplay = existingVersion
+				} else {
+					// Get local image digest and find matching version in THIS REPO
+					localDigest := getLocalImageDigest(ctx, cli, repoTag)
+					if localDigest != "" {
+						if repoVersions, ok := remoteVersionsByRepo[repository]; ok {
+							if versions, ok := repoVersions[baseName]; ok {
+								matchedVersion := GetVersionForDigest(versions, localDigest)
+								if matchedVersion != "" {
+									versionDisplay = matchedVersion
+								}
+							}
+						}
+					}
+				}
+
+				if versionDisplay == "" {
+					versionDisplay = "-"
+				}
+
+				if len(versionDisplay) > maxVersionLength {
+					maxVersionLength = len(versionDisplay)
+				}
+			}
+
+			row := []string{
 				repository,
 				tag,
-				image.ID[:12],
+				image.ID[7:19], // sha256: prefix removed, first 12 chars
 				created,
 				size,
 				status,
-			})
+			}
+
+			if showVersions {
+				row = append(row, versionDisplay)
+			}
+
+			tableData = append(tableData, row)
 		}
 	}
 
+	// Build headers
 	headers := []string{"Repository", "Tag", "Image ID", "Created", "Size", "Status"}
+	if showVersions {
+		headers = append(headers, "Version")
+	}
+
 	width, _, err := terminal.GetSize(int(os.Stdout.Fd()))
 	if err != nil {
-		width = 80 // default width if terminal size cannot be determined
+		width = 80
 	}
 
 	columnWidths := make([]int, len(headers))
@@ -1852,29 +2231,36 @@ func PrintImagesTable(labelKey string, labelValue string) {
 		}
 	}
 
-	// Ensure the "Status" column is wide enough
-	columnWidths[len(columnWidths)-1] = max(columnWidths[len(columnWidths)-1], maxStatusLength)
+	// Ensure Status column is wide enough
+	statusIdx := 5
+	columnWidths[statusIdx] = max(columnWidths[statusIdx], maxStatusLength)
 
-	// Adjust column widths to fit the terminal width
-	totalWidth := len(headers) + 1 // Adding 1 for the left border
+	// Ensure Version column is wide enough if present
+	if showVersions && maxVersionLength > 0 {
+		versionIdx := 6
+		columnWidths[versionIdx] = max(columnWidths[versionIdx], maxVersionLength)
+	}
+
+	// Adjust column widths
+	totalWidth := len(headers) + 1
 	for _, w := range columnWidths {
-		totalWidth += w + 2 // Adding 2 for padding
+		totalWidth += w + 2
 	}
 
 	if totalWidth > width {
-	    excess := totalWidth - width
-	    for i := range columnWidths[:len(columnWidths)-1] { // Don't reduce the last (Status) column
-	        reduction := excess / (len(columnWidths) - 1)
-	        if columnWidths[i] > reduction {
-	            columnWidths[i] -= reduction
-	            // Ensure minimum column width of 5 characters
-	            if columnWidths[i] < 5 {
-	                columnWidths[i] = 5
-	            }
-	            excess -= reduction
-	        }
-	    }
-	    totalWidth = width
+		excess := totalWidth - width
+		colsToAdjust := len(columnWidths) - 2
+		for i := range columnWidths[:colsToAdjust] {
+			reduction := excess / colsToAdjust
+			if columnWidths[i] > reduction {
+				columnWidths[i] -= reduction
+				if columnWidths[i] < 5 {
+					columnWidths[i] = 5
+				}
+				excess -= reduction
+			}
+		}
+		totalWidth = width
 	}
 
 	yellow := "\033[33m"
@@ -1890,7 +2276,7 @@ func PrintImagesTable(labelKey string, labelValue string) {
 	printHorizontalBorder(columnWidths, "├", "┼", "┤")
 
 	for i, row := range tableData {
-		printRowWithColor(row, columnWidths, "│")
+		printRowWithColorAndVersion(row, columnWidths, "│", showVersions)
 		if i < len(tableData)-1 {
 			printHorizontalBorder(columnWidths, "├", "┼", "┤")
 		}
@@ -1899,6 +2285,49 @@ func PrintImagesTable(labelKey string, labelValue string) {
 	printHorizontalBorder(columnWidths, "└", "┴", "┘")
 
 	fmt.Print(reset)
+	fmt.Println()
+}
+
+// max helper function (if not already present)
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// printRowWithColorAndVersion prints a row with status and version colors
+func printRowWithColorAndVersion(row []string, columnWidths []int, separator string, showVersions bool) {
+	green := "\033[32m"
+	red := "\033[31m"
+	yellow := "\033[33m"
+	cyan := "\033[36m"
+	reset := "\033[0m"
+
+	fmt.Print(separator)
+	for i, col := range row {
+		color := ""
+
+		if i == 5 { // Status column
+			switch col {
+			case "Custom", "No network":
+				color = yellow
+			case "Up to date":
+				color = green
+			case "Obsolete", "Error":
+				color = red
+			}
+		} else if showVersions && i == 6 && col != "-" { // Version column
+			color = cyan
+		}
+
+		if color != "" {
+			fmt.Printf(" %s%-*s%s ", color, columnWidths[i], truncateString(col, columnWidths[i]), reset)
+		} else {
+			fmt.Printf(" %-*s ", columnWidths[i], truncateString(col, columnWidths[i]))
+		}
+		fmt.Print(separator)
+	}
 	fmt.Println()
 }
 
@@ -1941,6 +2370,11 @@ func DeleteImage(imageIDOrTag string) error {
 	}
 	defer cli.Close()
 
+	// Normalize image reference (but not if it looks like an ID)
+	if !strings.HasPrefix(imageIDOrTag, "sha256:") && len(imageIDOrTag) != 12 && len(imageIDOrTag) != 64 {
+		imageIDOrTag = normalizeImageName(imageIDOrTag)
+	}
+
 	common.PrintInfoMessage(fmt.Sprintf("Attempting to delete image: %s", imageIDOrTag))
 
 	// List all images
@@ -1968,9 +2402,8 @@ func DeleteImage(imageIDOrTag string) error {
 		for _, tag := range img.RepoTags {
 			normalizedTag := tag
 
-			// If the input doesn't contain ":", prepend the repo
 			if !strings.Contains(imageIDOrTag, ":") {
-				imageIDOrTag = fmt.Sprintf("%s:%s", dockerObj.repotag, imageIDOrTag)
+				imageIDOrTag = formatImageRef(dockerObj.repotag, imageIDOrTag)
 			}
 
 			// Check for exact match first
@@ -2005,7 +2438,7 @@ func DeleteImage(imageIDOrTag string) error {
 			if len(parts) == 2 {
 				tagPart := parts[1]
 				cleanedTagPart := removeArchitectureSuffix(tagPart)
-				cleanTag = fmt.Sprintf("%s:%s", parts[0], cleanedTagPart)
+				cleanTag = formatImageRef(parts[0], cleanedTagPart)
 
 				if cleanTag == imageIDOrTag {
 					imageToDelete = img
@@ -2025,13 +2458,12 @@ func DeleteImage(imageIDOrTag string) error {
 		common.PrintErrorMessage(fmt.Errorf("image not found: %s", imageIDOrTag))
 		common.PrintInfoMessage("Available images:")
 		for _, img := range images {
-			// Display tags with clean names
 			displayTags := []string{}
 			for _, tag := range img.RepoTags {
 				parts := strings.Split(tag, ":")
 				if len(parts) == 2 {
 					cleanTagPart := removeArchitectureSuffix(parts[1])
-					displayTags = append(displayTags, fmt.Sprintf("%s:%s", parts[0], cleanTagPart))
+					displayTags = append(displayTags, formatImageRef(parts[0], cleanTagPart))
 				} else {
 					displayTags = append(displayTags, tag)
 				}
@@ -2042,14 +2474,12 @@ func DeleteImage(imageIDOrTag string) error {
 	}
 
 	imageID := imageToDelete.ID
-
-	// Display clean tag names in the confirmation
 	displayTags := []string{}
 	for _, tag := range imageToDelete.RepoTags {
 		parts := strings.Split(tag, ":")
 		if len(parts) == 2 {
 			cleanTagPart := removeArchitectureSuffix(parts[1])
-			displayTags = append(displayTags, fmt.Sprintf("%s:%s", parts[0], cleanTagPart))
+			displayTags = append(displayTags, formatImageRef(parts[0], cleanTagPart))
 		} else {
 			displayTags = append(displayTags, tag)
 		}
@@ -2213,151 +2643,67 @@ func showLoadingIndicator(ctx context.Context, commandFunc func() error, stepNam
 }
 
 func UpdateMountBinding(containerName string, source string, target string, add bool) {
-	var timeout = 10 // Stop timeout
-
-	// Check if the system is Windows
-	if runtime.GOOS == "windows" {
-		title := "Unsupported on Windows"
-		message := `This function is not supported on Windows.
-However, you can achieve similar functionality by using the following commands:
-- "rfswift commit" to create a new image with a new tag.
-- "rfswift remove" to remove the existing container.
-- "rfswift run" to run a container with new bindings.`
-
-		rfutils.DisplayNotification(title, message, "warning")
-		os.Exit(1) // Exit since this function is not supported on Windows
+	if err := ensureNotWindows("Mount binding update"); err != nil {
+		os.Exit(1)
 	}
 
 	if source == "" {
 		source = target
-		common.PrintWarningMessage(fmt.Sprintf("Source is empty. Defaulting source to target: %s", target))
 	}
 
-	// Check if source (host mount point) exists when adding a new binding
 	if add {
-		if _, err := os.Stat(source); os.IsNotExist(err) {
-			common.PrintErrorMessage(fmt.Errorf("host mount point does not exist: %s", source))
-			common.PrintInfoMessage("Please create the directory first or check the path")
-			os.Exit(1)
-		} else if err != nil {
-			common.PrintErrorMessage(fmt.Errorf("error checking host mount point: %v", err))
+		if _, err := os.Stat(source); err != nil {
+			common.PrintErrorMessage(fmt.Errorf("host mount point error: %w", err))
 			os.Exit(1)
 		}
-		common.PrintSuccessMessage(fmt.Sprintf("Verified host mount point exists: %s", source))
 	}
 
 	ctx := context.Background()
-
-	common.PrintInfoMessage("Fetching container ID...")
 	containerID := getContainerIDByName(ctx, containerName)
 	if containerID == "" {
 		common.PrintErrorMessage(fmt.Errorf("container %s not found", containerName))
 		os.Exit(1)
 	}
-	common.PrintSuccessMessage(fmt.Sprintf("Container ID: %s", containerID))
 
-	// Stop the container
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		common.PrintErrorMessage(fmt.Errorf("Error when instantiating a client"))
-		os.Exit(1)
-	}
-	common.PrintInfoMessage("Stopping the container...")
-
-	// Attempt graceful stop
-	if err := showLoadingIndicator(ctx, func() error {
-		return cli.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &timeout})
-	}, "Stopping the container..."); err != nil {
-		common.PrintErrorMessage(fmt.Errorf("Failed to stop the container gracefully: %v", err))
-		os.Exit(1)
-	}
-
-	// Check if the container is still running
-	containerJSON, err := cli.ContainerInspect(ctx, containerID)
-	if err != nil {
-		common.PrintErrorMessage(fmt.Errorf("Error inspecting container: %v", err))
-		os.Exit(1)
-	}
-	if containerJSON.State.Running {
-		common.PrintWarningMessage("Container is still running. Forcing stop...")
-		err = cli.ContainerKill(ctx, containerID, "SIGKILL")
-		if err != nil {
-			common.PrintErrorMessage(fmt.Errorf("Failed to force stop the container: %v", err))
-			os.Exit(1)
-		}
-		common.PrintSuccessMessage("Container forcibly stopped.")
-	} else {
-		common.PrintSuccessMessage(fmt.Sprintf("Container '%s' stopped", containerID))
-	}
-
-	// Load and update hostconfig.json
-	common.PrintInfoMessage("Determining hostconfig.json path...")
-	hostConfigPath, err := GetHostConfigPath(containerID)
 	if err != nil {
 		common.PrintErrorMessage(err)
 		os.Exit(1)
 	}
-	common.PrintSuccessMessage(fmt.Sprintf("HostConfig path: %s", hostConfigPath))
+	defer cli.Close()
 
-	common.PrintInfoMessage("Loading hostconfig.json...")
-	var hostConfig HostConfigFull
-	if err := loadJSON(hostConfigPath, &hostConfig); err != nil {
-		common.PrintErrorMessage(fmt.Errorf("failed to load hostconfig.json: %v", err))
+	if err := stopContainerForUpdate(ctx, cli, containerID); err != nil {
+		common.PrintErrorMessage(err)
 		os.Exit(1)
 	}
-	common.PrintSuccessMessage("HostConfig loaded successfully.")
 
-	// Load and update config.v2.json
-	common.PrintInfoMessage("Determining config.v2.json path...")
-	configV2Path := strings.Replace(hostConfigPath, "hostconfig.json", "config.v2.json", 1)
-	common.PrintInfoMessage(fmt.Sprintf("Loading config.v2.json from: %s", configV2Path))
-	var configV2 map[string]interface{}
-	if err := loadJSON(configV2Path, &configV2); err != nil {
-		common.PrintErrorMessage(fmt.Errorf("failed to load config.v2.json: %v", err))
+	hostConfig, configV2, hostConfigPath, err := loadContainerConfigs(containerID)
+	if err != nil {
+		common.PrintErrorMessage(err)
 		os.Exit(1)
 	}
-	common.PrintSuccessMessage("config.v2.json loaded successfully.")
 
-	// Update mounts in both files
-	common.PrintInfoMessage("Updating mounts...")
 	newMount := fmt.Sprintf("%s:%s", source, target)
 	if add {
 		if !ocontains(hostConfig.Binds, newMount) {
 			hostConfig.Binds = append(hostConfig.Binds, newMount)
 			addMountPoint(configV2, source, target)
-			common.PrintSuccessMessage(fmt.Sprintf("Added mount: %s", newMount))
-		} else {
-			common.PrintWarningMessage("Mount already exists.")
 		}
 	} else {
 		hostConfig.Binds = removeFromSlice(hostConfig.Binds, newMount)
 		removeMountPoint(configV2, target)
-		common.PrintSuccessMessage(fmt.Sprintf("Removed mount: %s", newMount))
 	}
 
-	// Save changes
-	common.PrintInfoMessage("Saving updated hostconfig.json...")
-	if err := saveJSON(hostConfigPath, hostConfig); err != nil {
-		common.PrintErrorMessage(fmt.Errorf("failed to save hostconfig.json: %v", err))
+	if err := saveContainerConfigs(hostConfigPath, hostConfig, configV2); err != nil {
+		common.PrintErrorMessage(err)
 		os.Exit(1)
 	}
-	common.PrintSuccessMessage("hostconfig.json updated successfully.")
 
-	common.PrintInfoMessage("Saving updated config.v2.json...")
-	if err := saveJSON(configV2Path, configV2); err != nil {
-		common.PrintErrorMessage(fmt.Errorf("failed to save config.v2.json: %v", err))
+	if err := RestartDockerService(); err != nil {
+		common.PrintErrorMessage(err)
 		os.Exit(1)
 	}
-	common.PrintSuccessMessage("config.v2.json updated successfully.")
-
-	// Restart the container
-	if err := showLoadingIndicator(ctx, func() error {
-		return RestartDockerService()
-	}, "Restarting Docker service..."); err != nil {
-		common.PrintErrorMessage(fmt.Errorf("failed to restart Docker service: %v", err))
-		os.Exit(1)
-	}
-	common.PrintSuccessMessage("Docker service restarted successfully.")
+	common.PrintSuccessMessage("Mount binding updated successfully.")
 }
 
 // execCommandWithOutput executes a command and returns its output
@@ -2420,142 +2766,63 @@ func removeMountPoint(config map[string]interface{}, target string) {
 }
 
 func UpdateDeviceBinding(containerName string, deviceHost string, deviceContainer string, add bool) {
-	var timeout = 10 // Stop timeout
-
-	// Check if the system is Windows
-	if runtime.GOOS == "windows" {
-		title := "Unsupported on Windows"
-		message := `This function is not supported on Windows.
-However, you can achieve similar functionality by using the following commands:
-- "rfswift commit" to create a new image with a new tag.
-- "rfswift remove" to remove the existing container.
-- "rfswift run" to run a container with new device bindings.`
-
-		rfutils.DisplayNotification(title, message, "warning")
-		os.Exit(1) // Exit since this function is not supported on Windows
+	if err := ensureNotWindows("Device binding update"); err != nil {
+		os.Exit(1)
 	}
 
 	if deviceHost == "" {
 		deviceHost = deviceContainer
-		common.PrintWarningMessage(fmt.Sprintf("Host device path is empty. Defaulting to container device path: %s", deviceContainer))
 	}
 
 	ctx := context.Background()
-
-	common.PrintInfoMessage("Fetching container ID...")
 	containerID := getContainerIDByName(ctx, containerName)
 	if containerID == "" {
 		common.PrintErrorMessage(fmt.Errorf("container %s not found", containerName))
 		os.Exit(1)
 	}
-	common.PrintSuccessMessage(fmt.Sprintf("Container ID: %s", containerID))
 
-	// Stop the container
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		common.PrintErrorMessage(fmt.Errorf("Error when instantiating a client"))
-		os.Exit(1)
-	}
-	common.PrintInfoMessage("Stopping the container...")
-
-	// Attempt graceful stop
-	if err := showLoadingIndicator(ctx, func() error {
-		return cli.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &timeout})
-	}, "Stopping the container..."); err != nil {
-		common.PrintErrorMessage(fmt.Errorf("Failed to stop the container gracefully: %v", err))
-		os.Exit(1)
-	}
-
-	// Check if the container is still running
-	containerJSON, err := cli.ContainerInspect(ctx, containerID)
-	if err != nil {
-		common.PrintErrorMessage(fmt.Errorf("Error inspecting container: %v", err))
-		os.Exit(1)
-	}
-	if containerJSON.State.Running {
-		common.PrintWarningMessage("Container is still running. Forcing stop...")
-		err = cli.ContainerKill(ctx, containerID, "SIGKILL")
-		if err != nil {
-			common.PrintErrorMessage(fmt.Errorf("Failed to force stop the container: %v", err))
-			os.Exit(1)
-		}
-		common.PrintSuccessMessage("Container forcibly stopped.")
-	} else {
-		common.PrintSuccessMessage(fmt.Sprintf("Container '%s' stopped", containerID))
-	}
-
-	// Load and update hostconfig.json
-	common.PrintInfoMessage("Determining hostconfig.json path...")
-	hostConfigPath, err := GetHostConfigPath(containerID)
 	if err != nil {
 		common.PrintErrorMessage(err)
 		os.Exit(1)
 	}
-	common.PrintSuccessMessage(fmt.Sprintf("HostConfig path: %s", hostConfigPath))
+	defer cli.Close()
 
-	common.PrintInfoMessage("Loading hostconfig.json...")
-	var hostConfig HostConfigFull
-	if err := loadJSON(hostConfigPath, &hostConfig); err != nil {
-		common.PrintErrorMessage(fmt.Errorf("failed to load hostconfig.json: %v", err))
+	if err := stopContainerForUpdate(ctx, cli, containerID); err != nil {
+		common.PrintErrorMessage(err)
 		os.Exit(1)
 	}
-	common.PrintSuccessMessage("HostConfig loaded successfully.")
 
-	// Load and update config.v2.json
-	common.PrintInfoMessage("Determining config.v2.json path...")
-	configV2Path := strings.Replace(hostConfigPath, "hostconfig.json", "config.v2.json", 1)
-	common.PrintInfoMessage(fmt.Sprintf("Loading config.v2.json from: %s", configV2Path))
-	var configV2 map[string]interface{}
-	if err := loadJSON(configV2Path, &configV2); err != nil {
-		common.PrintErrorMessage(fmt.Errorf("failed to load config.v2.json: %v", err))
+	hostConfig, configV2, hostConfigPath, err := loadContainerConfigs(containerID)
+	if err != nil {
+		common.PrintErrorMessage(err)
 		os.Exit(1)
 	}
-	common.PrintSuccessMessage("config.v2.json loaded successfully.")
 
-	// Update devices in both files
-	common.PrintInfoMessage("Updating devices...")
 	if add {
 		if !deviceExists(hostConfig.Devices, deviceHost, deviceContainer) {
-			newDevice := DeviceMapping{
+			hostConfig.Devices = append(hostConfig.Devices, DeviceMapping{
 				PathOnHost:        deviceHost,
 				PathInContainer:   deviceContainer,
-				CgroupPermissions: "rwm", // Default to read, write, mknod permissions
-			}
-			hostConfig.Devices = append(hostConfig.Devices, newDevice)
+				CgroupPermissions: "rwm",
+			})
 			addDeviceMapping(configV2, deviceHost, deviceContainer)
-			common.PrintSuccessMessage(fmt.Sprintf("Added device: %s to %s", deviceHost, deviceContainer))
-		} else {
-			common.PrintWarningMessage("Device mapping already exists.")
 		}
 	} else {
 		hostConfig.Devices = removeDeviceFromSlice(hostConfig.Devices, deviceHost, deviceContainer)
 		removeDeviceMapping(configV2, deviceHost, deviceContainer)
-		common.PrintSuccessMessage(fmt.Sprintf("Removed device: %s from %s", deviceHost, deviceContainer))
 	}
 
-	// Save changes
-	common.PrintInfoMessage("Saving updated hostconfig.json...")
-	if err := saveJSON(hostConfigPath, hostConfig); err != nil {
-		common.PrintErrorMessage(fmt.Errorf("failed to save hostconfig.json: %v", err))
+	if err := saveContainerConfigs(hostConfigPath, hostConfig, configV2); err != nil {
+		common.PrintErrorMessage(err)
 		os.Exit(1)
 	}
-	common.PrintSuccessMessage("hostconfig.json updated successfully.")
 
-	common.PrintInfoMessage("Saving updated config.v2.json...")
-	if err := saveJSON(configV2Path, configV2); err != nil {
-		common.PrintErrorMessage(fmt.Errorf("failed to save config.v2.json: %v", err))
+	if err := RestartDockerService(); err != nil {
+		common.PrintErrorMessage(err)
 		os.Exit(1)
 	}
-	common.PrintSuccessMessage("config.v2.json updated successfully.")
-
-	// Restart the container
-	if err := showLoadingIndicator(ctx, func() error {
-		return RestartDockerService()
-	}, "Restarting Docker service..."); err != nil {
-		common.PrintErrorMessage(fmt.Errorf("failed to restart Docker service: %v", err))
-		os.Exit(1)
-	}
-	common.PrintSuccessMessage("Docker service restarted successfully.")
+	common.PrintSuccessMessage("Device binding updated successfully.")
 }
 
 // UpdateCapability adds or removes a capability from a container
@@ -3096,7 +3363,7 @@ func ocontains(slice []string, item string) bool {
 }
 
 func loadJSON(path string, v interface{}) error {
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
@@ -3108,7 +3375,7 @@ func saveJSON(path string, v interface{}) error {
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, 0644)
 }
 
 func removeFromSlice(slice []string, item string) []string {
@@ -3132,6 +3399,67 @@ func getContainerIDByName(ctx context.Context, containerName string) string {
 		}
 	}
 	return ""
+}
+
+func ensureNotWindows(feature string) error {
+	if runtime.GOOS == "windows" {
+		message := fmt.Sprintf(`%s is not supported on Windows.
+Use "rfswift commit", "rfswift remove", and "rfswift run" instead.`, feature)
+		rfutils.DisplayNotification("Unsupported on Windows", message, "warning")
+		return fmt.Errorf("unsupported on Windows")
+	}
+	return nil
+}
+
+func stopContainerForUpdate(ctx context.Context, cli *client.Client, containerID string) error {
+	timeout := 10
+	if err := cli.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &timeout}); err != nil {
+		return fmt.Errorf("failed to stop container: %w", err)
+	}
+
+	containerJSON, err := cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return fmt.Errorf("failed to inspect container: %w", err)
+	}
+
+	if containerJSON.State.Running {
+		if err := cli.ContainerKill(ctx, containerID, "SIGKILL"); err != nil {
+			return fmt.Errorf("failed to force stop container: %w", err)
+		}
+	}
+	return nil
+}
+
+func loadContainerConfigs(containerID string) (*HostConfigFull, map[string]interface{}, string, error) {
+	hostConfigPath, err := GetHostConfigPath(containerID)
+	if err != nil {
+		return nil, nil, "", err
+	}
+
+	var hostConfig HostConfigFull
+	if err := loadJSON(hostConfigPath, &hostConfig); err != nil {
+		return nil, nil, "", fmt.Errorf("failed to load hostconfig.json: %w", err)
+	}
+
+	configV2Path := strings.Replace(hostConfigPath, "hostconfig.json", "config.v2.json", 1)
+	var configV2 map[string]interface{}
+	if err := loadJSON(configV2Path, &configV2); err != nil {
+		return nil, nil, "", fmt.Errorf("failed to load config.v2.json: %w", err)
+	}
+
+	return &hostConfig, configV2, hostConfigPath, nil
+}
+
+func saveContainerConfigs(hostConfigPath string, hostConfig *HostConfigFull, configV2 map[string]interface{}) error {
+	if err := saveJSON(hostConfigPath, hostConfig); err != nil {
+		return fmt.Errorf("failed to save hostconfig.json: %w", err)
+	}
+
+	configV2Path := strings.Replace(hostConfigPath, "hostconfig.json", "config.v2.json", 1)
+	if err := saveJSON(configV2Path, configV2); err != nil {
+		return fmt.Errorf("failed to save config.v2.json: %w", err)
+	}
+	return nil
 }
 
 func DockerStop(containerIdentifier string) {
@@ -3213,9 +3541,9 @@ func DockerUpgrade(containerIdentifier string, repositoriesToPreserve string, ne
 		// If no image specified, use the current image's latest version
 		repo, _ := parseImageName(originalImage)
 		newImage = fmt.Sprintf("%s:latest", repo)
-	} else if !strings.Contains(newImage, ":") {
-		// Add repo prefix if needed
-		newImage = fmt.Sprintf("%s:%s", dockerObj.repotag, newImage)
+	} else {
+		// Normalize the provided image name
+		newImage = normalizeImageName(newImage)
 	}
 
 	common.PrintInfoMessage("═══════════════════════════════════════")
@@ -3668,7 +3996,7 @@ func createTarArchive(srcDir string, containerPath string) (io.ReadCloser, error
 func BuildFromRecipe(recipeFile string, tagOverride string, noCache bool) error {
 	// Read recipe file
 	common.PrintInfoMessage(fmt.Sprintf("Reading recipe from: %s", recipeFile))
-	data, err := ioutil.ReadFile(recipeFile)
+	data, err := os.ReadFile(recipeFile)
 	if err != nil {
 		return fmt.Errorf("failed to read recipe file: %v", err)
 	}
@@ -3709,7 +4037,7 @@ func BuildFromRecipe(recipeFile string, tagOverride string, noCache bool) error 
 	}
 
 	// Generate final image name
-	finalImage := fmt.Sprintf("%s:%s", recipe.Name, recipe.Tag)
+	finalImage := formatImageRef(recipe.Name, recipe.Tag)
 	common.PrintSuccessMessage(fmt.Sprintf("Building image: %s", finalImage))
 
 	// Generate Dockerfile
@@ -3727,7 +4055,7 @@ func BuildFromRecipe(recipeFile string, tagOverride string, noCache bool) error 
 
 	// Write Dockerfile to temp directory
 	dockerfilePath := filepath.Join(tempDir, "Dockerfile")
-	if err := ioutil.WriteFile(dockerfilePath, []byte(dockerfile), 0644); err != nil {
+	if err := os.WriteFile(dockerfilePath, []byte(dockerfile), 0644); err != nil {
 		return fmt.Errorf("failed to write Dockerfile: %v", err)
 	}
 
@@ -4034,6 +4362,11 @@ func ExportImage(images []string, outputFile string) error {
 	}
 	defer cli.Close()
 
+	// Normalize all image names
+	for i, img := range images {
+		images[i] = normalizeImageName(img)
+	}
+
 	common.PrintInfoMessage(fmt.Sprintf("Exporting %d image(s) to %s", len(images), outputFile))
 	for _, img := range images {
 		common.PrintInfoMessage(fmt.Sprintf("  - %s", img))
@@ -4178,6 +4511,7 @@ func ImportImage(inputFile string) error {
 	return nil
 }
 
+
 // SaveImageToFile pulls an image and saves it to a tar.gz file
 func SaveImageToFile(imageName string, outputFile string, pullFirst bool) error {
 	ctx := context.Background()
@@ -4186,6 +4520,9 @@ func SaveImageToFile(imageName string, outputFile string, pullFirst bool) error 
 		return fmt.Errorf("failed to create Docker client: %v", err)
 	}
 	defer cli.Close()
+
+	// Normalize image name
+	imageName = normalizeImageName(imageName)
 
 	// Check if image exists locally
 	_, _, err = cli.ImageInspectWithRaw(ctx, imageName)
@@ -4838,7 +5175,7 @@ func StartLogging(outputFile string, useScript bool) error {
 	// Write state to file for persistence
 	stateFile := filepath.Join(os.TempDir(), "rfswift-logging.state")
 	state := fmt.Sprintf("%d\n%s\n%s", loggingPID, loggingFile, loggingTool)
-	if err := ioutil.WriteFile(stateFile, []byte(state), 0644); err != nil {
+	if err := os.WriteFile(stateFile, []byte(state), 0644); err != nil {
 		common.PrintWarningMessage(fmt.Sprintf("Failed to save state: %v", err))
 	}
 
@@ -4877,7 +5214,7 @@ func StartLogging(outputFile string, useScript bool) error {
 func StopLogging() error {
 	// Try to load state from file
 	stateFile := filepath.Join(os.TempDir(), "rfswift-logging.state")
-	data, err := ioutil.ReadFile(stateFile)
+	data, err := os.ReadFile(stateFile)
 	if err == nil {
 		parts := strings.Split(strings.TrimSpace(string(data)), "\n")
 		if len(parts) >= 3 {
@@ -5018,7 +5355,7 @@ func ListLogs(logDir string) error {
 }
 
 // DockerRunWithRecording runs a container with session recording
-func DockerRunWithRecording(containerName string, outputFile string) error {
+func DockerRunWithRecording(containerName string, recordOutput string, image string, extraArgs map[string]string) error {
 	// Detect recording tool
 	tool, err := detectLoggingTool(false)
 	if err != nil {
@@ -5026,16 +5363,16 @@ func DockerRunWithRecording(containerName string, outputFile string) error {
 	}
 
 	// Generate output filename if not provided
-	if outputFile == "" {
+	if recordOutput == "" {
 		timestamp := time.Now().Format("20060102-150405")
 		if tool == "asciinema" {
-			outputFile = fmt.Sprintf("rfswift-run-%s-%s.cast", containerName, timestamp)
+			recordOutput = fmt.Sprintf("rfswift-run-%s-%s.cast", containerName, timestamp)
 		} else {
-			outputFile = fmt.Sprintf("rfswift-run-%s-%s.log", containerName, timestamp)
+			recordOutput = fmt.Sprintf("rfswift-run-%s-%s.log", containerName, timestamp)
 		}
 	}
 	
-	common.PrintInfoMessage(fmt.Sprintf("🔴 Recording session with %s to: %s", tool, outputFile))
+	common.PrintInfoMessage(fmt.Sprintf("🔴 Recording session with %s to: %s", tool, recordOutput))
 
 	// Get the current executable path
 	executable, err := os.Executable()
@@ -5043,19 +5380,31 @@ func DockerRunWithRecording(containerName string, outputFile string) error {
 		return fmt.Errorf("failed to get executable path: %v", err)
 	}
 
-	// Simple command without PS1 modification
+	// Build the full command with all necessary flags
 	runCmdStr := fmt.Sprintf("%s run -n %s", executable, containerName)
+	
+	// Add image if specified
+	if image != "" {
+		runCmdStr += fmt.Sprintf(" -i %s", image)
+	}
+	
+	// Add extra arguments
+	for flag, value := range extraArgs {
+		if value != "" {
+			runCmdStr += fmt.Sprintf(" %s %s", flag, value)
+		}
+	}
 
 	var recordCmd *exec.Cmd
 	
 	switch tool {
 	case "asciinema":
-		recordCmd = exec.Command("asciinema", "rec", "-c", runCmdStr, outputFile)
+		recordCmd = exec.Command("asciinema", "rec", "-c", runCmdStr, recordOutput)
 	case "script":
 		if runtime.GOOS == "darwin" {
-			recordCmd = exec.Command("script", "-q", "-c", runCmdStr, outputFile)
+			recordCmd = exec.Command("script", "-q", "-c", runCmdStr, recordOutput)
 		} else {
-			recordCmd = exec.Command("script", "-q", "-f", "-c", runCmdStr, outputFile)
+			recordCmd = exec.Command("script", "-q", "-f", "-c", runCmdStr, recordOutput)
 		}
 	}
 
@@ -5063,25 +5412,33 @@ func DockerRunWithRecording(containerName string, outputFile string) error {
 	recordCmd.Stdout = os.Stdout
 	recordCmd.Stderr = os.Stderr
 
-	// Run the recorded session
 	if err := recordCmd.Run(); err != nil {
 		return fmt.Errorf("recording session failed: %v", err)
 	}
 
-	// Reset terminal title
 	fmt.Printf("\033]0;Terminal\007")
-	
-	common.PrintSuccessMessage(fmt.Sprintf("🔴 Session recorded to: %s", outputFile))
+	common.PrintSuccessMessage(fmt.Sprintf("🔴 Session recorded to: %s", recordOutput))
 	
 	return nil
 }
 
 // DockerExecWithRecording executes into a container with session recording
-func DockerExecWithRecording(containerIdentifier string, workingDir string, outputFile string) error {
+func DockerExecWithRecording(containerIdentifier string, workingDir string, recordOutput string, execCommand string) error {
 	// Detect recording tool
 	tool, err := detectLoggingTool(false)
 	if err != nil {
 		return err
+	}
+
+	// If no container specified, get the latest one
+	if containerIdentifier == "" {
+		labelKey := "org.container.project"
+		labelValue := "rfswift"
+		containerIdentifier = latestDockerID(labelKey, labelValue)
+		if containerIdentifier == "" {
+			return fmt.Errorf("no container specified and no recent rfswift container found")
+		}
+		common.PrintInfoMessage(fmt.Sprintf("Using latest container: %s", containerIdentifier))
 	}
 
 	// Get container name for filename
@@ -5092,24 +5449,23 @@ func DockerExecWithRecording(containerIdentifier string, workingDir string, outp
 	}
 	defer cli.Close()
 
+	containerName := containerIdentifier
 	containerJSON, err := cli.ContainerInspect(ctx, containerIdentifier)
-	if err != nil {
-		containerIdentifier = "unknown"
-	} else {
-		containerIdentifier = strings.TrimPrefix(containerJSON.Name, "/")
+	if err == nil {
+		containerName = strings.TrimPrefix(containerJSON.Name, "/")
 	}
 
 	// Generate output filename if not provided
-	if outputFile == "" {
+	if recordOutput == "" {
 		timestamp := time.Now().Format("20060102-150405")
 		if tool == "asciinema" {
-			outputFile = fmt.Sprintf("rfswift-exec-%s-%s.cast", containerIdentifier, timestamp)
+			recordOutput = fmt.Sprintf("rfswift-exec-%s-%s.cast", containerName, timestamp)
 		} else {
-			outputFile = fmt.Sprintf("rfswift-exec-%s-%s.log", containerIdentifier, timestamp)
+			recordOutput = fmt.Sprintf("rfswift-exec-%s-%s.log", containerName, timestamp)
 		}
 	}
 	
-	common.PrintInfoMessage(fmt.Sprintf("🔴 Recording session with %s to: %s", tool, outputFile))
+	common.PrintInfoMessage(fmt.Sprintf("🔴 Recording session with %s to: %s", tool, recordOutput))
 
 	// Get the current executable path
 	executable, err := os.Executable()
@@ -5117,19 +5473,27 @@ func DockerExecWithRecording(containerIdentifier string, workingDir string, outp
 		return fmt.Errorf("failed to get executable path: %v", err)
 	}
 
-	// Simple command without PS1 modification
-	execCmdStr := fmt.Sprintf("%s exec -c %s -w %s", executable, containerIdentifier, workingDir)
+	// Build command with container ID (now guaranteed to be set)
+	execCmdStr := fmt.Sprintf("%s exec -c %s", executable, containerIdentifier)
+	
+	if workingDir != "" && workingDir != "/root" {
+		execCmdStr += fmt.Sprintf(" -w %s", workingDir)
+	}
+	
+	if execCommand != "" && execCommand != "/bin/bash" {
+		execCmdStr += fmt.Sprintf(" -e %s", execCommand)
+	}
 
 	var recordCmd *exec.Cmd
 	
 	switch tool {
 	case "asciinema":
-		recordCmd = exec.Command("asciinema", "rec", "-c", execCmdStr, outputFile)
+		recordCmd = exec.Command("asciinema", "rec", "-c", execCmdStr, recordOutput)
 	case "script":
 		if runtime.GOOS == "darwin" {
-			recordCmd = exec.Command("script", "-q", "-c", execCmdStr, outputFile)
+			recordCmd = exec.Command("script", "-q", "-c", execCmdStr, recordOutput)
 		} else {
-			recordCmd = exec.Command("script", "-q", "-f", "-c", execCmdStr, outputFile)
+			recordCmd = exec.Command("script", "-q", "-f", "-c", execCmdStr, recordOutput)
 		}
 	}
 
@@ -5137,15 +5501,118 @@ func DockerExecWithRecording(containerIdentifier string, workingDir string, outp
 	recordCmd.Stdout = os.Stdout
 	recordCmd.Stderr = os.Stderr
 
-	// Run the recorded session
 	if err := recordCmd.Run(); err != nil {
 		return fmt.Errorf("recording session failed: %v", err)
 	}
 
-	// Reset terminal title
 	fmt.Printf("\033]0;Terminal\007")
-	
-	common.PrintSuccessMessage(fmt.Sprintf("📹 Session recorded to: %s", outputFile))
+	common.PrintSuccessMessage(fmt.Sprintf("📹 Session recorded to: %s", recordOutput))
 	
 	return nil
+}
+
+// DockerPullVersion pulls a specific version of an image
+func DockerPullVersion(imageref string, version string, imagetag string) {
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		common.PrintErrorMessage(err)
+		return
+	}
+	defer cli.Close()
+
+	architecture := getArchitecture()
+	if architecture == "" {
+		common.PrintErrorMessage(fmt.Errorf("unsupported architecture"))
+		return
+	}
+
+	// If no version specified, use regular pull
+	if version == "" {
+		DockerPull(imageref, imagetag)
+		return
+	}
+
+	common.PrintInfoMessage(fmt.Sprintf("Looking for version %s of %s...", version, imageref))
+
+	// Find the version in remote repos
+	repo, digest, baseName, err := FindVersionInRemote(imageref, version, architecture)
+	if err != nil {
+		common.PrintErrorMessage(err)
+		common.PrintInfoMessage("Use 'rfswift images versions' to see available versions")
+		return
+	}
+
+	common.PrintSuccessMessage(fmt.Sprintf("Found version %s in %s", version, repo))
+	common.PrintInfoMessage(fmt.Sprintf("Digest: %s", digest[:min(32, len(digest))]))
+
+	// Build the versioned tag name with architecture
+	// Format: baseName_version_architecture (e.g., reversing_0.0.7_amd64)
+	versionedTag := fmt.Sprintf("%s_%s_%s", baseName, version, architecture)
+	pullRef := formatImageRef(repo, versionedTag)
+
+	// Set display tag - use underscore format without 'v' prefix
+	// Format: repo:baseName_version (e.g., penthertz/rfswift_noble:reversing_0.0.7)
+	if imagetag == "" {
+		imagetag = fmt.Sprintf("%s:%s_%s", repo, baseName, version)
+	}
+
+	common.PrintInfoMessage(fmt.Sprintf("Pulling %s...", pullRef))
+
+	out, err := cli.ImagePull(ctx, pullRef, image.PullOptions{})
+	if err != nil {
+		common.PrintErrorMessage(fmt.Errorf("failed to pull image: %v", err))
+		return
+	}
+	defer out.Close()
+
+	// Process pull output
+	fd, isTerminal := term.GetFdInfo(os.Stdout)
+	jsonDecoder := json.NewDecoder(out)
+	for {
+		var msg jsonmessage.JSONMessage
+		if err := jsonDecoder.Decode(&msg); err == io.EOF {
+			break
+		} else if err != nil {
+			common.PrintErrorMessage(err)
+			return
+		}
+		if isTerminal {
+			_ = jsonmessage.DisplayJSONMessagesStream(out, os.Stdout, fd, isTerminal, nil)
+		} else {
+			fmt.Println(msg)
+		}
+	}
+
+	// Get the pulled image info
+	remoteInspect, _, err := cli.ImageInspectWithRaw(ctx, pullRef)
+	if err != nil {
+		common.PrintErrorMessage(err)
+		return
+	}
+
+	// Tag with friendly name (without architecture suffix)
+	err = cli.ImageTag(ctx, remoteInspect.ID, imagetag)
+	if err != nil {
+		common.PrintErrorMessage(err)
+		return
+	}
+
+	common.PrintSuccessMessage(fmt.Sprintf("Image tagged as '%s'", imagetag))
+
+	// Optionally remove the architecture-suffixed tag to keep things clean
+	_, err = cli.ImageRemove(ctx, pullRef, image.RemoveOptions{Force: false})
+	if err == nil {
+		common.PrintInfoMessage(fmt.Sprintf("Removed architecture-suffixed tag: %s", pullRef))
+	}
+
+	common.PrintSuccessMessage(fmt.Sprintf("Version %s installed successfully!", version))
+}
+
+// min helper function
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
